@@ -1,0 +1,87 @@
+name: Mirror KDE static kitinerary-extractor
+
+# Republishes KDE's own official static kitinerary-extractor build (built from
+# source by the KDE CI `static-extractor` job, published to cdn.kde.org) as a
+# pinned release asset in this repo, so downstream deploys pull from a source we
+# control and never depend on a third-party personal repo staying online.
+# Provenance stays with KDE upstream; we only mirror + pin.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kde_branch:
+        description: KDE CI-build branch under cdn.kde.org/ci-builds/pim/kitinerary
+        default: release-26.04
+        required: true
+  schedule:
+    - cron: '0 5 1 * *' # monthly, to pick up new KDE point releases
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve latest KDE static build
+        id: resolve
+        run: |
+          set -euo pipefail
+          BRANCH="${{ github.event.inputs.kde_branch || 'release-26.04' }}"
+          DIR="https://cdn.kde.org/ci-builds/pim/kitinerary/${BRANCH}/linux"
+          TGZ=$(curl -fsSL "$DIR/" \
+            | grep -oE 'kitinerary-extractor-x86_64-[0-9.]+\.tgz' \
+            | sort -V | tail -1)
+          if [ -z "$TGZ" ]; then echo "::error::no archive at $DIR"; exit 1; fi
+          VER=$(echo "$TGZ" | sed -E 's/kitinerary-extractor-x86_64-([0-9.]+)\.tgz/\1/')
+          {
+            echo "url=$DIR/$TGZ"
+            echo "version=$VER"
+            echo "tag=kde-$VER"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $TGZ (version $VER)"
+
+      - name: Download and verify against KDE's published sha256
+        id: dl
+        run: |
+          set -euo pipefail
+          URL="${{ steps.resolve.outputs.url }}"
+          curl -fsSL "$URL" -o kde.tgz
+          curl -fsSL "$URL.sha256" -o kde.tgz.sha256
+          KDE_HASH=$(awk '{print $1}' kde.tgz.sha256)
+          echo "${KDE_HASH}  kde.tgz" | sha256sum -c -
+          tar xzf kde.tgz bin/kitinerary-extractor
+          mv bin/kitinerary-extractor kitinerary-extractor
+          chmod +x kitinerary-extractor
+          OUR_HASH=$(sha256sum kitinerary-extractor | awk '{print $1}')
+          {
+            echo "kde_archive_sha256=$KDE_HASH"
+            echo "our_sha256=$OUR_HASH"
+          } >> "$GITHUB_OUTPUT"
+          echo "binary sha256: $OUR_HASH"
+
+      - name: Publish pinned release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.tag }}"
+          VER="${{ steps.resolve.outputs.version }}"
+          NOTES=$(printf '%s\n' \
+            "Mirror of KDE's official static kitinerary-extractor build." \
+            "" \
+            "Source archive: ${{ steps.resolve.outputs.url }}" \
+            "KItinerary version: ${VER}" \
+            "KDE archive sha256: ${{ steps.dl.outputs.kde_archive_sha256 }}" \
+            "Extracted binary (this asset) sha256: ${{ steps.dl.outputs.our_sha256 }}" \
+            "" \
+            "Built from source by KDE CI (pim/kitinerary static-extractor job). We only mirror + pin.")
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" kitinerary-extractor --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" kitinerary-extractor \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "KItinerary extractor ${VER} (KDE static, linux-x86_64)" \
+              --notes "$NOTES"
+          fi
+          echo "Published ${TAG} · asset kitinerary-extractor · sha256 ${{ steps.dl.outputs.our_sha256 }}"
